@@ -1,0 +1,338 @@
+---
+title: "Attributes favourable to Restaurant Success"
+author: "Edwin Seah"
+date: "21 November 2015"
+output:
+    pdf_document
+---
+```{r global_options, include=FALSE}
+# Setting global options for R markdown
+knitr::opts_chunk$set(fig.width=5, 
+                      fig.height=5,
+                      fig.path='figures/',
+                      echo=TRUE, 
+                      warning=FALSE,
+                      message=FALSE,
+                      cache=TRUE)
+```
+
+### 1. Introduction - Preamble and Research Questions
+
+In the Yelp! dataset challenge, participants are provided with rich real-life data from Yelp! and asked to present and answer open-ended questions about the list of businesses, ratings and user behaviour. Large numbers of eating establishments are represented in the dataset; Yelp!'s raison d'etre and format tend to favour the review of such businesses and its use by a community of users. The project is therefore interested in the following questions:
+
+- What characteristics does a highly rated restaurant possess that are roughly consistent across different locations (states/cities)? 
+- Do such restaurants obtain more positive tips that are useful to potential customers than those rated lowly? 
+- Is it possible to generate a reasonable and useful model that predicts their rating from these characteristics/review/tip types?
+
+The response variable is ``stars`` (business rating) which has levels from 1 to 5 in 0.5 steps. An attempt at classifying the most favourable characteristics by location(state, city) is made, then the sentiment of review text is checked. For brevity, not all code is shown although the the full code is available from the Rmd document.
+
+### 2. Methods
+
+#### 2.1. Data Sources, Cleaning and Transforming
+
+The dataset used is the academic dataset provided from the sixth Yelp! dataset challenge. The data is read into a series of three data frames (business, tip, review) using ``readr::read_lines()`` and ``jsonlite::fromJSON()``, and flatten using ``lapply(filesToRead, function(x) fromJSON(sprintf("[%s]", paste(read_lines(x), collapse=",")), flatten=TRUE))``. As the dataset is large and converting from JSON into a usable format is excruciatingly slow, the data frames are cached into .rds files and read from there.
+
+```{r load_yelp_data, cache=TRUE, echo=FALSE, eval=FALSE}
+# Download and unzip the raw data if it isn't already in local folder
+rawfile <- "yelp_dataset_challenge_academic_dataset.zip"
+if(!file.exists(rawfile)) {
+    fileurl <- paste0("https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/", rawfile)
+    download.file(fileurl, rawfile, method="curl")
+    unzip(rawfile)
+}
+# Get the data from raw json as data frames
+filenames <- c("business", "tip", "review", "user")
+filesToRead <- paste0('../yelp_data/yelp_academic_dataset_', filenames, '.json')
+data <- lapply(filesToRead, function(x) fromJSON(sprintf("[%s]", paste(read_lines(x), collapse=",")), flatten=TRUE))
+names(data) <- filenames # Name the data frames according to the order they got read in
+```
+```{r cacheRDS, cache=TRUE, eval=FALSE, echo=FALSE}
+saveRDS(business, file="business.rds", compress=TRUE)
+saveRDS(tip, file="tip.rds", compress=TRUE)
+saveRDS(checkin, file="checkin.rds", compress=TRUE)
+saveRDS(review, file="review.rds", compress=TRUE)
+saveRDS(user, file="user.rds", compress=TRUE)
+```
+```{r readRDS, cache=TRUE}
+filenames <- c("business", "tip", "review", "user")
+vecRDS <- paste0("../data/yelp/", filenames, ".rds")
+business <- readRDS(vecRDS[1]); tip <- readRDS(vecRDS[2])
+review <- readRDS(vecRDS[3]); user <- readRDS(vecRDS[4])
+```
+
+For usage in sentiment analysis of review/tip texts, a combined list of positive/negative words from A.Finn(2011) ``dict.afinn`` and Hu,Liu (2004) ``dict.huliu`` is used. They are merged after scaling the former AFINN-111 (containing nuanced scores) to between -1 and 1 to match the latter, then joined into one set of positive and negative words. The enlarged set provides better coverage over a wider variety of English terms. ``vec.pos`` and ``vec.neg`` are kept as vectors of the final postive and negative words.
+
+```{r load_external_data, cache=TRUE, echo=FALSE, eval=FALSE}
+# Load the AFINN-111 English word list with positive/negative valence scores
+# This list has both positivity and nuance
+fn_afinn111 <- "imm6010.zip"
+src_afinn111 <- "http://www2.imm.dtu.dk/pubdb/views/edoc_download.php/6010/zip/imm6010.zip"
+if(!file.exists(fn_afinn111)) {
+    fileurl <- paste0("http://www2.imm.dtu.dk/pubdb/views/edoc_download.php/6010/zip/", fn_afinn111)
+    download.file(src_afinn111, rawfile, method="curl")
+    unzip(rawfile)
+}
+```
+```{r load_and_merge_dicts, cache=TRUE, echo=FALSE}
+library(dplyr)
+# AFINN-111 +ve/-ve list
+dict.afinn <- read.csv2("../data/external/AFINN/AFINN-111.txt", 
+                   sep="\t", 
+                   col.names = c("word", "score")) %>% mutate(score=score/5) # Normalize to -1:1
+# Hu and Liu's +ve/-ve list of 6800 words
+dict.huliu <- rbind(read.csv2("../data/external/opinion-lexicon-English/positive-words.txt", 
+                          col.names=c("word"), 
+                          comment.char=";") %>% mutate(score=1),
+                read.csv2("../data/external/opinion-lexicon-English/negative-words.txt", 
+                          col.names=c("word"), 
+                          comment.char=";") %>% mutate(score=-1))
+```
+```{r load_merged_dict, cache=TRUE}
+# Merge them into one single set, using only -1 or 1 to denote +/- sentiment
+dict.terms <- merge(dict.huliu, dict.afinn, by.x="word", by.y="word", all=TRUE) %>%
+    mutate(score=ifelse((!is.na(score.x)), score.x, ifelse((score.y>0), 1, -1))) %>% 
+    select(word, score)
+vec.pos <- as.vector(dict.terms[dict.terms$score>0,]$word)
+vec.neg <- as.vector(dict.terms[dict.terms$score<0,]$word)
+```
+
+To filter for businesses which are restaurants or serve food, ``grep`` is run on the category column from the business dataset for "Food|Restaurants", and subsets are taken accordingly by intersecting with ``business_ids`` from reviews and tips. A series of transformations is applied as follows:
+- factorizing stars variable
+- flattening of nested lists
+- removing redundant and irrelevant variables/attributes, such as "Hair|Insurance"
+- turn column names R-compatible using ``make.names()``
+- converting city names from unicode to ascii equivalent
+
+```{r subset_restaurants, cache=TRUE}
+# Subset the other data frames for only restaurants (subset is fastest)
+b.rest <- business[grep("Food|Restaurants", business$categories),]
+b.rest$categories <- sapply(b.rest$categories, toString)
+b.rest <- subset(b.rest, select=-c(type, grep("Hair|Insurance", names(b.rest))))
+t.rest <- subset(tip, business_id %in% b.rest$business_id, select=-c(type))
+r.rest <- subset(review, business_id %in% b.rest$business_id, select=-c(type))
+names(b.rest) <- make.names(names(b.rest)) # make R-compatible colnames
+b.rest <- b.rest %>% mutate(stars=as.factor(stars)) # Transform stars into character
+```
+
+```{r flatten_nested_list, cache=TRUE, echo=FALSE}
+# Flattens attribute with nested list even after flatten in fromJSON was applied
+nullToNA <- function(a) { lapply(a, function(x) ifelse(is.null(x), NA, x)) }
+dropList <- function(a) { lapply(a, function(x) unlist(x)) }
+b.rest <- b.rest %>% mutate(attributes.Accepts.Credit.Cards = as.logical(dropList(nullToNA(dropList(attributes.Accepts.Credit.Cards)))))
+```
+
+```{r transform_biz_city, cache=TRUE, echo=FALSE}
+b.rest[grep("Montreal", b.rest$city),]$city <- "Montreal"
+b.rest[grep("Las Vegas", b.rest$city),]$city <- "Las Vegas"
+b.rest[grep("Scottsdale", b.rest$city),]$city <- "Scottsdale"
+b.rest[grep("Glendale", b.rest$city),]$city <- "Glenndale"
+b.rest[grep("Phoenix", b.rest$city),]$city <- "Phoenix"
+b.rest[grep("Edinburgh", b.rest$city),]$city <- "Edinburgh"
+b.rest[grep("Henderson", b.rest$city),]$city <- "Henderson"
+b.rest$city <- gsub("^(.+)(\u00e8)(.+)", "\\1e\\3", b.rest$city)
+b.rest$city <- gsub("^(.+)(\u00e9)(.+)", "\\1e\\3", b.rest$city)
+b.rest$city <- gsub("^(.+)(\u00ce)(.+)", "\\1i\\3", b.rest$city)
+b.rest$city <- gsub("^(.+)(\u00f6)(.+)", "\\1o\\3", b.rest$city)
+```
+
+As inspired by the approach to factorization taken in [(Gupta, Singh and Singh)](http://www.yelp.com/html/pdf/YelpDatasetChallengeWinner_CollectiveFactorization.pdf), all attributes are transformed into boolean values (T/F). Columns with free-text values are also flattened into additional factor columns ("Wi-Fi" into Wifi.paid", "Wifi.free", "Wifi.none"). Hours are condensed into seven T/F columns for each day of the week, marked T/F (open/close on the day). Attributes with higher than 90% of NAs are also removed, since these will not contribute much to the classification task.
+
+```{r function_factorToBool, echo=FALSE, cache=TRUE}
+# Function to transform columns with factor values into multiple binary-valued attributes
+factorToBool <- function(a, s) {
+    values <- sort(as.character(unique(na.omit(a)))) # need to cast as chr for int vectors
+    df.Tmp <- as.data.frame(cbind(a, sapply(values, function(.a) a == .a))) # input col a retained for debug
+    colnames(df.Tmp) <- paste0(s, colnames(df.Tmp))
+    for (i in 1:length(df.Tmp)) {df.Tmp[,i] <- as.logical(df.Tmp[,i])}
+    df.Tmp[, -1] # return the transformed df without the input column
+}
+```
+
+```{r transform_biz_attributes, echo=FALSE, cache=TRUE}
+# Drop NA with threshold set at 90%
+b.rest[colMeans(is.na(b.rest))>0.9] <- list(NULL)
+b.att <- subset(b.rest, select=c(grep("stars|attributes", names(b.rest))))
+vec.att <- lapply(names(b.att), function(x) ifelse(!is.logical(b.att[,x]), x, NA))
+vec.att <- as.vector(unlist(vec.att[grep("attributes", vec.att)]))
+b.att.Tmp <- lapply(vec.att, function(x) factorToBool(unlist(b.att[[x]]), paste0(x, ".")))
+b.att.Tmp <- Reduce(function(x,y) {cbind(x,y)}, b.att.Tmp)
+b.att <- subset(b.att, select=-grep(paste(vec.att, collapse="|"), names(b.att))) # drops flattened
+b.att <- cbind(b.att, b.att.Tmp)
+rm(vec.att, b.att.Tmp)
+```
+
+```{r transform_biz_hours, echo=FALSE, cache=TRUE}
+b.open <- b.rest[,grep("hours.+open", names(b.rest),)]
+b.open <- !is.na(b.open)
+colnames(b.open) <- gsub("(hours.)(.+).(open)", "\\3.\\2", colnames(b.open))
+```
+
+The text in reviews is also grouped according to how many stars the reviewer accorded the business along with their reviews, which can the provide a baseline sentiment to use for our classification task.
+
+```{r subset_review_text, echo=FALSE, cache=TRUE}
+rev1 <- r.rest[r.rest$stars==1, "text"]; rev2 <- r.rest[r.rest$stars==2, "text"]
+rev3 <- r.rest[r.rest$stars==3, "text"]; rev4 <- r.rest[r.rest$stars==4, "text"]
+rev5 <- r.rest[r.rest$stars==5, "text"]
+```
+
+#### 2.2. EDA
+
+Checking the distribution of restaurants brings us into an issue with our research question; inconsistency in numbers of restaurants across states/cities within the dataset may derail attempts at classification. Indeed, some states are represented by only one entry.
+
+```{r eda_location_biz_bystate, fig.height=5, fig.width=7, cache=TRUE, echo=FALSE}
+b.loc <- subset(b.rest, select=c(business_id,stars,state,city))
+locS <- b.loc %>% group_by(state) %>% dplyr::summarise(nr=n())
+lattice::barchart(locS$nr~as.factor(locS$state), xlab="States", ylab="Number of Businesses")
+```
+
+We arrive at the following candidate cities for location-specific restaurants after restricting to states with having at least the median number of businesses amongst states, and at least the mean number amongst cities. Plotting with ``lattice`` yields:
+
+```{r eda_location_biz_bycity, fig.width=15, echo=FALSE, cache=TRUE}
+library(gridExtra)
+vec.state <- locS[locS$n>median(locS$n),]$state
+b.loc <- b.loc[b.loc$state %in% vec.state,]
+locC <- b.loc %>% group_by(state, city) %>% dplyr::summarize(n=n())
+locC1 <- locC[locC$n>mean(locC$n),] %>% mutate(loc=paste0(city,", ",state))
+vec.city <- unique(locC1$city)
+scaleCtl <- list(x=list(rot=90))
+plot1 <- barchart(locC$n~as.factor(locC$city), xlab="Cities", ylab="No. of Businesses", 
+                  scales=scaleCtl, main="By Cities")
+plot2 <- barchart(locC1$n~as.factor(locC1$loc), xlab="Locations", ylab="No. of Businesses", 
+                  scales=scaleCtl, main="By Location")
+grid.arrange(plot1, plot2, ncol=2)
+```
+
+Our plots show the large variance in numbers; some states/cities are actually represented by only one business, let alone individual neighbourhoods. Nevertheless, we proceed with the analysis by restricting to city-level and assume different parts of the city as synonymous to the city itself. We attempt to predict star ratings viz their business attributes and days open for the following, denoted as ``B``:
+
+```{r subset_by_city, cache=TRUE}
+b.loc <- b.loc[b.loc$city %in% vec.city,]
+B <- select(b.rest, c(business_id, state, city))
+B <- cbind(B, b.att, b.open) # combine with attributes, opening days
+B <- B[B$business_id %in% b.loc$business_id,]
+```
+
+```{r show_data_used, cache=TRUE, echo=FALSE, eval=FALSE}
+B %>% group_by(state, city) %>% summarize(n=n())
+```
+
+#### 2.3. Establishing an error estimate baseline by classifying attributes/opening days
+
+Despite numerous NAs in the data, we proceed and split into train (60%), test (20%) and validation sets (20%) using a custom-defined function ``createSets``. For fitting, we use a classification tree (``rpart``) and a boosted regression tree (``gbm``). An error estimate is calculated from these models.
+
+```{r functions_classification, echo=FALSE, cache=TRUE}
+library(caret); library(gbm)
+# Function that parititions x into pTrain proportion training, and half each of the remainder into test and validation sets. Returns list(trainSet, testSet, validationSet)
+createSets <- function(x, pTrain) {
+    idx.train <- createDataPartition(x$stars, p=pTrain, list=FALSE)
+    train <- x[idx.train,]
+    remainSet <- x[-idx.train,]
+    idx.test <- createDataPartition(remainSet$stars, p=0.5, list=FALSE)
+    test <- remainSet[idx.test,]
+    valid <- remainSet[-idx.test,]
+    return(list(trainSet=train, testSet=test, validationSet=valid))
+}
+# Summary function for model x on newdata, returns confusion matrix, prediction results, error estimate
+metrics <- function(model, newdata) {
+    mx.conf <- confusionMatrix(newdata$stars, predict(model, newdata, na.action=na.pass))
+    predictions <- predict(model, newdata, na.action=na.pass)
+    errorEstimate <- signif(sum(predictions != newdata$stars)/length(newdata$stars)*100, digits=3)
+    return(list(mx.conf, predictions, errorEstimate))
+}
+```
+
+```{r generate_train_test_validation_sets, cache=TRUE}
+set.seed(350); data <- B[,4:length(B)]; sets <- createSets(data, 0.6)
+trainSet <- sets[[1]]; testSet <- sets[[2]]; validationSet <- sets[[3]]
+```
+
+```{r generate_model, cache=TRUE}
+## RPart
+modRpart <- train(as.factor(stars)~., method="rpart", 
+                  control=rpart.control(xval=5, minsplit=15, minbucket=5, cp=0.01, maxdepth=15),
+                  na.action=na.pass, data=trainSet)
+## GBM with 3-fold CV
+fitControl <- trainControl(method = "repeatedcv", number = 3, repeats = 3)
+modGBM <- train(stars~., method="gbm", data=trainSet, na.action=na.pass, 
+                trControl=fitControl, verbose=FALSE)
+```
+
+```{r generate_model_attonly, echo=FALSE, cache=TRUE}
+set.seed(350); sets <- createSets(b.att, 0.6)
+trainAtt <- sets[[1]]; testAtt <- sets[[2]]; validationAtt <- sets[[3]]
+modRpartAtt <- train(as.factor(stars)~., method="rpart", control=rpart.control(xval=5, minsplit=15, minbucket=5, cp=0.01, maxdepth=15), na.action=na.pass, data=trainAtt)
+modGBMAtt <- train(stars~., method="gbm", data=trainAtt, na.action=na.pass, trControl=fitControl, verbose=FALSE)
+```
+
+#### 2.4. Sentiment scoring review text
+
+Using the positive and negative word lists combined from A.Finn(2011) and Hu,Liu (2004), we grade the sentiment for restaurant reviews and generate a score capturing the nominal sentiment per star grouping. Review text is transformed with ``tm`` into lower-case with newlines, stopwords, punctuation and numbers removed, but opt to user a custom function instead of a corpus from ``tm``:
+
+```{r function_scoreReviewText, cache=TRUE}
+# Returns score of +/- words from vector "txt" 
+# using + and - word vectors "pos" and "neg"
+library(tm)
+scoreReviewText <- function(txt, pos, neg) {
+    t <- tolower(txt); t <- removeWords(t, words = stopwords("en"))
+    t <- gsub("\\.", " ", t); t <- gsub("\\\n", "", t)
+    t <- removePunctuation(t); t <- removeNumbers(t)
+    s <- lapply(strsplit(t, " ", fixed=TRUE), function(x) ifelse(!duplicated(x), x, ""))
+    sapply(s, function(x) sum(pos %in% x)-sum(neg %in% x))
+}
+```
+
+```{r sentiment_scoring, echo=FALSE, cache=TRUE}
+# Split up into 1 to 5 star reviews and score them for sentiment
+rev1 <- r.rest[r.rest$stars==1, "text"]; score1s <- scoreReviewText(rev1, vec.pos, vec.neg)
+rev2 <- r.rest[r.rest$stars==2, "text"]; score2s <- scoreReviewText(rev2, vec.pos, vec.neg)
+rev3 <- r.rest[r.rest$stars==3, "text"]; score3s <- scoreReviewText(rev3, vec.pos, vec.neg)
+rev4 <- r.rest[r.rest$stars==4, "text"]; score4s <- scoreReviewText(rev4, vec.pos, vec.neg)
+rev5 <- r.rest[r.rest$stars==5, "text"]; score5s <- scoreReviewText(rev5, vec.pos, vec.neg)
+```
+
+### 3. Results
+
+Classifying using attributes and opening days, the classification error estimates (calculated with a user-defined function ``metrics(model, newdata)``) from both methods indicate clearly that a coin-flip works better. Our results from omitting opening days also seem to indicate opening days hardly matter either in influencing the outcome, at least based on the error estimates:
+
+```{r generate_metrics, cache=TRUE}
+modE <- rbind(Rpart=metrics(modRpart, testSet)[[3]], 
+                  GBM=metrics(modGBM, testSet)[[3]])
+modEAtt <- rbind(Rpart=metrics(modRpartAtt, testSet)[[3]], 
+                     GBM=metrics(modGBMAtt, testSet)[[3]])
+modE <- cbind(modE, modEAtt)
+colnames(modE) <- c("ErrEst(%).all", "ErrEst(%).attributesOnly") ; modE
+```
+
+Plotting the results indicates that reviews do have a tendency to match the ratings given, although the variability is rather large. This suggests the word lists used may be insufficient to cover the breadth of sentiment, but says nothing about whether there are many shill reviews within the lot.
+
+```{r violin_plot_review, fig.width=15, cache=TRUE}
+library(vioplot)
+vioplot::vioplot(score1s, score2s, score3s, score4s, score5s, col="blue", horizontal=TRUE,
+                 rectCol="gray", colMed="black")
+title("Sentiment Scores by Star groups")
+```
+
+### 4. Discussion - Results and Follow-ups
+
+The results from the attempt at classification was rather dismal, characterised by high error estimates. Our classification task was hampered by large numbers of NAs within the attributes. The fragmented nature of the data was ill-suited to the question, or rather, vice versa. Insufficient data was usable to train any model based simply on a combination of characteristics. The disappointing conclusion may be that classification by attribute is the wrong approach to use in this case.
+
+On a positive note, sentiment scores for review text are distinctly banded, implying text is more valuable in this dataset than business characteristics, which have little use for prediction tasks.
+
+```{r sentiment_banding_summary, echo=FALSE, cache=TRUE}
+as.data.frame(cbind(stars=1:5, 
+                    rbind(summary(score1s), summary(score2s), summary(score3s), 
+                          summary(score4s), summary(score5s))))
+```
+
+Perhaps restaurants already know that beyond simple local discovery, attributes and taking time to enhance the listing is not nearly as important as concentrating on their core function; GOOD FOOD. The result is reflected in the review texts; good food draws effusive reviews and higher ratings that tend to accumulate over time.
+
+Generalising the approach to non-food related businesses may not help us find a good model of attributes either. Approaches which focus on the review text itself should work better than business characteristics; after all, the reviews are continuously updated with newer reviews/ratings and grows, while business attributes are inherently more static. Given that there sentiment scores look like they fall into bands, albeit overlapping, making use of reviews upvoted by users may be helpful in providing a scaling factor to use, or simply to predict ratings.
+
+More interesting follow-ups would include investigation into applying further NLP techniques on the text data, along with additional qualitative factorization methods on the user-contributed corpus. Perhaps an investigation into multiple ngram tokenization of phrases will provide better quality sentiment scores, or provide a proxy voting mechanism as additional explanatory variables, rather than just one-word sentiment alone.
+
+### 5. Project Repo and References
+
++ All files and full code used are available from the [Github Project Repository](https://github.com/slothdev/capstone)
++ [Yelp Dataset used](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/yelp_dataset_challenge_academic_dataset.zip)
++ [Collective Factorization for Relational Data: An Evaluation on the Yelp Datasets](http://www.yelp.com/html/pdf/YelpDatasetChallengeWinner_CollectiveFactorization.pdf) Nitish Gupta, Indian Institute of Technology, Kanpur and Sameer Singh, University of Washington.
++ Finn Arup Nielsen, "A new ANEW: evaluation of a word list for sentiment analysis in microblogs", Proceedings of the ESWC2011 Workshop on 'Making Sense of Microposts': Big things come in small packages. Volume 718 in CEUR Workshop Proceedings: 93-98. 2011 May. Matthew Rowe, Milan Stankovic, Aba-Sah Dadzie, Mariann Hardey (editors). Links: [Paper](http://arxiv.org/pdf/1103.2903v1.pdf) and [Word list](http://www2.imm.dtu.dk/pubdb/views/edoc_download.php/6010/zip/imm6010.zip)
++ Minqing Hu and Bing Liu. "Mining and Summarizing Customer Reviews." Proceedings of the ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD-2004), Aug 22-25, 2004, Seattle, Washington, USA. Links: [Paper](http://www.cs.uic.edu/~liub/publications/kdd04-revSummary.pdf), [Page](http://www.cs.uic.edu/~liub/FBS/sentiment-analysis.html), [Word list](https://github.com/jeffreybreen/twitter-sentiment-analysis-tutorial-201107/blob/master/data/opinion-lexicon-English/)

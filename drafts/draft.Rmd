@@ -1,0 +1,405 @@
+---
+title: "Untitled"
+author: "Edwin Seah"
+date: "7 October 2015"
+output: html_document
+---
+```{r global_options, include=FALSE}
+# Setting global options for R markdown
+knitr::opts_chunk$set(fig.path='figures/',
+                      echo=TRUE, 
+                      warning=FALSE,
+                      message=FALSE)
+```
+Introduction
+Effusive reviews garnered from 5-star reviews or mediocre from 1-star reviews
+
+Yelp Dataset Challenge 2014 Submission UCSD - Increasing temporal trend towards 4 and 5-star reviews
+, Majority are 3-star and above, skewed towards 4/5stars, Bigram multinomial naive bayes trained faster with precision/recall comparable to RF
+
+Valence constrains the information density of messages - "quadratic relationship between average lexical information and review rating. This suggests participants may be choosing lower frequent terms–greater lexical richness–when composing reviews at the extremes of the scale (in contrast to our hypothesis that positive reviews, specifically, would be of greater lexical richness)."
+
+Collective Factorization Modelling - "user-word" relation provides higher gains than incorporating information about businesses, but more importantly, integrating information about both businesses and users achieves the best performance; share factors for entities; user-biases towards certain categories, indicative of likes/dislikes
+
+Combine factorization with Bigram multinomial NB
+
+Research Questions:
+
+What characteristics does a highly rated restaurant possess that are roughly consistent across different locations? Do such restaurants obtain more positive tips that are useful to potential customers than those rated lowly? Is it possible to generate a reasonable and useful model that predicts their rating from these characteristics/review/tip types?
+
+Load required packages.
+
+```{r imports, cache=TRUE}
+library(readr)
+library(jsonlite)
+library(dplyr)
+```
+
+Load data.
+
+```{r load_data, cache=TRUE, eval=FALSE}
+# Download and unzip the raw data if it isn't already in local folder
+rawfile <- "yelp_dataset_challenge_academic_dataset.zip"
+if(!file.exists(rawfile)) {
+    fileurl <- paste0("https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/", rawfile)
+    download.file(fileurl, rawfile, method="curl")
+    unzip(rawfile)
+}
+# Get the data from raw json as data frames
+filenames <- c("business", "tip", "checkin", "review", "user")
+filesToRead <- paste0('../yelp_data/yelp_academic_dataset_', filenames, '.json')
+eda.data <- lapply(filesToRead, function(x) fromJSON(sprintf("[%s]", paste(read_lines(x, n_max=1000), collapse=",")), flatten=TRUE))
+# Name the data frames according to the order they got read in
+names(eda.data) <- filenames
+```
+
+Loading external data needed for positive/negative review words
+
+```{r load_external_data, eval=FALSE}
+# Load the AFINN-111 English word list with positive/negative valence scores
+# This list has both positivity and nuance
+fn_afinn111 <- "imm6010.zip"
+src_afinn111 <- "http://www2.imm.dtu.dk/pubdb/views/edoc_download.php/6010/zip/imm6010.zip"
+if(!file.exists(fn_afinn111)) {
+    fileurl <- paste0("http://www2.imm.dtu.dk/pubdb/views/edoc_download.php/6010/zip/", fn_afinn111)
+    download.file(src_afinn111, rawfile, method="curl")
+    unzip(rawfile)
+}
+dict.afinn <- read.csv2("../data/external/AFINN/AFINN-111.txt", 
+                   sep="\t", 
+                   col.names = c("word", "score")) %>% mutate(score=score/5) # Normalize to -1:1
+# Hu and Liu's +ve/-ve list of 6800 words
+library(dplyr)
+dict.huliu <- rbind(read.csv2("../data/external/opinion-lexicon-English/positive-words.txt", 
+                          col.names=c("word"), 
+                          comment.char=";") %>% mutate(score=1),
+                read.csv2("../data/external/opinion-lexicon-English/negative-words.txt", 
+                          col.names=c("word"), 
+                          comment.char=";") %>% mutate(score=-1))
+dict.terms <- merge(dict_huliu, dict_afinn, by.x="word", by.y="word", all=TRUE) %>% mutate(score=ifelse((is.na(score.x)), score.y, score.x)) %>% select(word, score)
+dict.terms <- merge(dict_huliu, dict_afinn, by.x="word", by.y="word", all=TRUE) %>% mutate(score=ifelse((!is.na(score.x)), score.x, ifelse((score.y>0), 1, -1))) %>% select(word, score)
+```
+
+Cache into RDS for better loading times.
+
+```{r cacheRDS, cache=TRUE, eval=FALSE, echo=FALSE}
+saveRDS(business, file="business.rds", compress=TRUE)
+saveRDS(tip, file="tip.rds", compress=TRUE)
+saveRDS(checkin, file="checkin.rds", compress=TRUE)
+saveRDS(review, file="review.rds", compress=TRUE)
+saveRDS(user, file="user.rds", compress=TRUE)
+# reloading from cached data
+vecRDS <- paste0("../yelp_data/", filenames, ".rds")
+business <- readRDS(vecRDS[1])
+tip <- readRDS(vecRDS[2])
+checkin <- readRDS(vecRDS[3])
+review <- readRDS(vecRDS[4])
+user <- readRDS(vecRDS[5])
+```
+
+Load sample subset from data.
+
+```{r loadSubset}
+print(names(eda.data$business))
+```
+
+EDA:
+
+```{r EDA}
+dat <- eda.data
+library(lattice)
+# Business [61184] - characteristics of business (location, open/close dates, service types)
+# uuid: business_id
+# type: business
+# Checkin [45166] - list of check-ins (date, rating) per business id
+# uuid: business_id
+# type: checkin
+# Review [1569264] - list of reviews and upvotes by business_id and date
+# uuid: review_id
+# type: review
+# link: user_id, business_id
+# Tip [495107] - short tips per business_id per user_id
+# uuid: user_id
+# link: business_id
+# User [366715]- user and friend metadata
+# uuid: user_id
+# link: user_id (friends)
+
+review <- dat$review
+xyplot(review$stars~as.Date.character(review$date))
+# are there more 4/5 star reviews in latter years
+library(lubridate)
+ry.df <- review %>% select(stars,date) %>% mutate(year=year(date)) %>% select(stars, year)
+bwplot(ry.df$stars~ry.df$year)
+library(reshape2)
+acast(ry.df, stars~year, length)
+# Buisness categories by review_count
+business[grep("Malaysian", business$categories),]$review_count
+# Tip text by business_id
+i <- business[grep("German", business$categories),]$business_id
+subset(tip, business_id %in% i)$text
+
+# EDA only
+sapply(b.hours[,grep("open", names(b.hours))], function(x) table(x<="09:00"))
+#ifelse(h<="09:00", bkfast, ifelse(h<="13:00", lunch, ifelse(h<="20:00", dinner, ifelse(h>"20:00", drinks))))
+sapply(b.hours[,grep("open", names(b.hours))], function(x) table(!is.na(x)))
+
+# EDA shows only some states have larger data sets to use
+tt <- b.loc %>% group_by(state) %>% summarise_each(funs(length), stars)
+```
+
+Just grab all businesses that are restaurants or serve food, removing redundant and irrelevant variables/attributes. # Subset the other data frames for only restaurants (subset is fastest)
+
+```{r subsettingRestaurants, eval=FALSE}
+b.rest <- business[grep("Food|Restaurants", business$categories),]
+names(b.rest) <- make.names(names(b.rest)) # make R-compatible colnames
+b.rest <- subset(b.rest, select=-c(type, grep("Hair|Insurance", names(b.rest)))) # remove irrelevant
+t.rest <- subset(tip, business_id %in% b.rest$business_id, select=-c(type))
+r.rest <- subset(review, business_id %in% b.rest$business_id, select=-c(type))
+c.rest <- subset(checkin, business_id %in% b.rest$business_id, select=-c(type))
+```
+
+Clean up nested list
+
+``````{r cleaning, eval=FALSE}
+nullToNA <- function(a) {
+    lapply(a, function(x) ifelse(is.null(x), NA, x))
+}
+dropList <- function(a) {
+    lapply(a, function(x) unlist(x))
+}
+b.rest <- b.rest %>% mutate(attributes.Accepts.Credit.Cards = as.logical(dropList(nullToNA(dropList(attributes.Accepts.Credit.Cards))))) %>% mutate(stars=as.factor(stars))
+```
+
+Grab a location subset
+
+```{r subsettingLocation, eval=FALSE}
+b.loc <- subset(b, select=c(business_id, stars, state, city, neighborhoods, longitude, latitude))
+lattice::bwplot(b.loc$stars~b.loc$state) # stars distribution within states
+```
+
+Build Categories sparse matrix. # Matrix of category relations for businesses
+
+```{r matrix_categories, eval=FALSE}
+library(tidyr)
+vec.cat <- unique(unlist(b.rest$categories))
+b.cat <- subset(b.rest, select = c("business_id", "categories"))
+b.cat <- tidyr::separate(data=b.cat, col = categories, into = vec.cat, sep=",", remove = FALSE, fill="right")
+
+b.cat <- separate(data=b.cat, col = categories, into = vec.cat, sep=",", remove = FALSE, fill="left")
+b.cat[,3:length(b.cat)] <- F
+lapply(1:length(b.cat$categories), function(i) { j <- unlist(b.cat$categories[i]); b.cat[i, j] <<- T })
+
+bca.s <- separate(data=bcsmall, col = categories, into = unlist(unique(bcsmall$categories)), sep=",", remove = FALSE, fill="right")
+
+vec.cat %in% unlist(aaa[11,"categories"])
+str(lapply(b.cat$categories, function(x) vec.cat %in% x))
+
+
+b.cat <- subset(b.cat, select=-c(business_id, categories))
+b.cat <- !is.na(b.cat)
+# Create logical matrix
+library(Matrix)
+mx.cat <- Matrix(as.matrix(b.cat), sparse=TRUE,)
+
+vec.cat %in% unlist(bcsmall11$categories)
+```
+
+Hours matrix - Seperate into 4 groups (before 09:00, before 13:30, before 20:00, after 20:00)
+
+```{r matrix_hours, eval=FALSE}
+b.open <- b.rest[,grep("hours.+open", names(b.rest),)]
+b.open <- !is.na(b.open)
+colnames(b.open) <- gsub("(hours.)(.+).(open)", "\\3.\\2", colnames(b.open))
+mx.open <- Matrix(as.matrix(b.open), sparse=TRUE)
+```
+
+Review matrix
+rating: >4 high, <4 low. votes: >2 non-zero votes
+```{r matrix_review}
+#EDA
+mean(r.rest[r.rest["votes.cool"]>0,"votes.cool"]) # check the means of non-zero votes, should be 2
+library(dplyr)
+r.rev <- r.rest[,grep("stars|votes", names(r.rest))] %>% 
+    mutate(high=ifelse(stars>=4, T, F)) %>%
+    mutate(low=ifelse(stars<4, T, F)) %>%
+    mutate(v.funny=ifelse(votes.funny>=2, T, F)) %>% 
+    mutate(v.useful=ifelse(votes.useful>=2, T, F)) %>% 
+    mutate(v.cool=ifelse(votes.cool>=2, T, F))
+mx.rev <- Matrix(as.matrix(r.rev[c("high", "low", "funny", "useful", "cool")]), sparse=TRUE)
+```
+
+We'll need to tranform some attributes into binary factors with boolean values.
+
+```{r transformation, eval=FALSE}
+# Transform stars into character
+# Drop NA with threshold set at 90%
+b.rest[colMeans(is.na(b.rest))>0.9] <- list(NULL)
+# Function to transform columns with factor values into multiple binary-valued attributes
+factorToBool <- function(a, s) {
+    values <- sort(as.character(unique(na.omit(a)))) # need to cast as chr for int vectors
+    df.Tmp <- as.data.frame(cbind(a, sapply(values, function(.a) a == .a))) # input col a retained for debug
+    colnames(df.Tmp) <- paste0(s, colnames(df.Tmp))
+    for (i in 1:length(df.Tmp)) {df.Tmp[,i] <- as.logical(df.Tmp[,i])}
+    df.Tmp[, -1] # return the transformed df without the input column
+}
+
+b.att <- subset(b.rest, select=c(grep("stars|attributes", names(b.rest))))
+vec.att <- lapply(names(b.att), function(x) ifelse(!is.logical(b.att[,x]), x, NA))
+vec.att <- as.vector(unlist(vec.att[grep("attributes", vec.att)]))
+b.att.Tmp <- lapply(vec.att, function(x) factorToBool(unlist(b.att[[x]]), paste0(x, ".")))
+b.att.Tmp <- Reduce(function(x,y) {cbind(x,y)}, b.att.Tmp)
+b.att <- subset(b.att, select=-grep(paste(vec.att, collapse="|"), names(b.att))) # drops flattened
+b.att <- cbind(b.att, b.att.Tmp)
+rm(vec.att, b.att.Tmp)
+```
+
+Corpus building
+- since sentiment, keep sparse terms above higher cutoff 
+```{r tdm_corpus, eval=FALSE}
+library(tm)
+getCorpus <- function(x, cutoff) {
+  corpus = Corpus(VectorSource(x))
+  corpus = tm_map(corpus, tolower)
+  corpus = tm_map(corpus, PlainTextDocument)
+  corpus = tm_map(corpus, removePunctuation)
+  corpus = tm_map(corpus, removeWords, stopwords("english"))
+  corpus = tm_map(corpus, stemDocument)
+
+  dtm = DocumentTermMatrix(corpus)
+  sparse = removeSparseTerms(dtm, cutoff) 
+  words = as.data.frame(as.matrix(sparse))
+  colnames(words) = make.names(colnames(words))
+
+  return(words)
+}
+
+corpus <- Corpus(VectorSource(review$text))
+corpus <- tm_map(corpus, tolower)  # Convert all text to lower case
+dtm <- DocumentTermMatrix(corpus, list(dictionary = words_dict))
+
+corpus_tip <- Corpus(VectorSource(tip$text))
+corpus_rev <- Corpus(VectorSource(review$text))
+
+corpus_tip <- getCorpus(VectorSource(tip$text), 0.5)
+corpus_rev <- getCorpus(VectorSource(review$text), 0.5)
+```
+
+```{r tidying, eval=FALSE}
+## Factorizing Ratings (votes?) and Reviews
+library(tidyr)
+fReview <- review %>% 
+    mutate(funny=ifelse(votes.funny>0, 1, 0)) %>% 
+    mutate(useful=ifelse(votes.useful>0, 1, 0)) %>% 
+    mutate(cool=ifelse(votes.cool>0, 1, 0))
+subReview <- subset(review, select=c(review_id, stars, votes, date))
+#mean(review[review$votes$funny>0,]$votes$funny) # 1.526627
+#mean(review[review$votes$useful>0,]$votes$useful) # 1.735065
+#mean(review[review$votes$cool>0,]$votes$cool) # 1.485437
+```
+
+Building NB model
+
+```{r prediction, eval=FALSE}
+library(caret)
+# Paritition our data into 70% training, 15& test, 15% validation sets
+createSets <- function(x, pTrain) {
+    set.seed(350)
+    idx.train <- createDataPartition(x$stars, p=pTrain, list=FALSE)
+    train <- x[idx.train,]
+    remainSet <- x[-idx.train,]
+    idx.test <- createDataPartition(remainSet$stars, p=0.5, list=FALSE)
+    test <- remainSet[idx.test,]
+    valid <- remainSet[-idx.test,]
+    return(list(trainSet=train, testSet=test, validationSet=valid))
+}
+
+metrics <- function(model, newdata) {
+    mx.conf <- confusionMatrix(newdata$stars, predict(modRpart, newdata, na.action=na.pass))
+    predictions <- predict(model, newdata, na.action=na.pass)
+    errorEstimate <- sum(predictions != newdata$stars)/length(newdata$stars)
+    return(list(mx.conf, predictions, errorEstimate))
+}
+
+library(caret)
+sets <- createSets(df, 0.7)
+trainSet <- sets[[1]]; testSet <- sets[[2]]; validationSet <- sets[[3]]
+
+## GBM with 3-fold CV
+library(gbm);
+fitControl <- trainControl(method = "repeatedcv", number = 3, repeats = 3)
+modGBM <- train(stars~., method="gbm", data=trainSet, na.action=na.pass, trControl=fitControl, verbose=FALSE)
+
+## RPart
+modRpart <- train(as.factor(stars)~., method="rpart", control=rpart.control(xval=5, minsplit=15, minbucket=5, cp=0.01, maxdepth=15), na.action=na.pass, data=trainSet)
+metrics(modRpart, testSet)
+
+# C50 Quinlan
+library(C50); 
+fitControl <- C5.0Control(winnow=TRUE)
+modC50 <- C5.0(as.factor(trainSet$stars)~., na.action=na.pass, data=trainSet)
+
+# RF
+library(randomForest)
+modRF <- randomForest(as.factor(stars)~., data=trainSet)
+varImpPlot(modRF)
+prediction <- predict(modRF, testSet, na.action=na.pass)
+confusionMatrix(testSet$stars, predict(modRF, data=na.omit(testSet))) # 39.6%
+
+library(e1071)
+# Titanic example
+data(Titanic)
+m <- naiveBayes(Survived ~ ., data = Titanic)
+m
+predict(m, as.data.frame(Titanic))
+modNB <- naiveBayes(as.factor(stars)~., data=trainSet, na.action=na.pass)
+
+# EDA
+# almost 1/3 are NA
+summary(colMeans(is.na(b))>0.9)
+plot(colMeans(is.na(b)))
+# Drop hours
+b[grep("hours", names(b))] <- list(NULL)
+
+# Restaurant
+ra <- naiveBayes()
+
+```
+
+Evaluation of results
+
+```{r evaluation, eval=FALSE}
+library (ROCR);
+y <- ... # logical array of positive / negative cases
+predictions <- ... # array of predictions
+
+pred <- prediction(predictions, y);
+
+# Recall-Precision curve
+RP.perf <- performance(pred, "prec", "rec");
+plot (RP.perf);
+
+# ROC curve
+ROC.perf <- performance(pred, "tpr", "fpr");
+plot (ROC.perf);
+
+# ROC area under the curve
+auc.tmp <- performance(pred,"auc");
+auc <- as.numeric(auc.tmp@y.values)
+```
+
+# price.range ($= under $10, $$= $11-$30, $$$= $31-$60, $$$$= above $61)
+
+### Project Repo and References
+
++ All files and full code used are available from my [Github Project Repository](https://github.com/slothdev/capstone)
++ [Yelp Dataset](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/yelp_dataset_challenge_academic_dataset.zip)
++ [Build out valid JSON array from given pseudo-JSON](https://class.coursera.org/dsscapstone-005/forum/thread?thread_id=24) 
++ [stackoverflow: Building out valid JSON array from given pseudo-JSON by first constructing valid JSON](http://stackoverflow.com/questions/26519455/error-parsing-json-file-with-the-jsonlite-package)
++ [Yelp dataset challenge data dictionary](http://www.yelp.com/dataset_challenge)
+
++ [Personalizing Yelp Star Ratings: a Semantic Topic Modeling Approach](http://www.yelp.com/html/pdf/YelpDatasetChallengeWinner_PersonalizingRatings.pdf) Jack Linshi. Yale University。
++ [Valence Constrains the Information Density of Messages](http://www.yelp.com/html/pdf/YelpDatasetChallengeWinner_InformationDensity.pdf) David W. Vinson, Rick Dale. University of California, Merced。
++ [Yelp Dataset Challenge 2014 Submission](http://kevin11h.github.io/YelpDatasetChallengeDataScienceAndMachineLearningUCSD/) Kevin Hung and Henry Qiu, University of California, San Diego.
++ [Collective Factorization for Relational Data: An Evaluation on the Yelp Datasets](http://www.yelp.com/html/pdf/YelpDatasetChallengeWinner_CollectiveFactorization.pdf) Nitish Gupta, Indian Institute of Technology, Kanpur and Sameer Singh, University of Washington.
++ [Naive bayes in R](http://stackoverflow.com/questions/9157626/naive-bayes-in-r)
